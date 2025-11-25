@@ -1,9 +1,8 @@
 from flask import Flask, request, jsonify, render_template
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.exc import SQLAlchemyError
 import json
 import os
-import redis
-from rq import Queue
-from .tasks import process_new_case_job
 from pydantic import BaseModel, Field
 
 # Importações do Gemini
@@ -19,36 +18,41 @@ class TriageOutput(BaseModel):
     urgencia: str = Field(description="Classificação da urgência (ex: 'Alta', 'Média', 'Baixa').")
 
 
-# --- 2. CONFIGURAÇÃO DA FILA (RQ/Redis) ---
+# --- 2. CONFIGURAÇÃO DO FLASK E SQLALCHEMY (MySQL) ---
 
-# Conexão REAL com o servidor Redis (porta e host padrão)
-redis_conn = redis.Redis()
-# Cria uma fila chamada 'cases'
-q = Queue('cases', connection=redis_conn)
+app = Flask(__name__)
 
-def process_new_case_job(case_data):
-    """
-    ⚠️ Esta é a função do WORKER. Ela será executada pelo sistema do especialista 
-    quando ele puxar a tarefa da fila.
-    """
-    print("--- INICIANDO PROCESSAMENTO DO CASO PELO WORKER ---")
-    print(f"Área Classificada: {case_data.get('area_problema')}")
-    print(f"Resumo do Caso: {case_data.get('fatos_chave')}")
-    # A lógica REAL de inserção no DB do especialista e envio de notificação entra aqui.
-    print("--- CASO PROCESSADO E ENVIADO PARA ATENDIMENTO ---")
+# Configuração para MySQL - Use Variáveis de Ambiente ou substitua com seus dados
+DB_USER = os.getenv("MYSQL_USER", "root")
+DB_PASSWORD = os.getenv("MYSQL_PASSWORD", "sua_senha_secreta")
+DB_HOST = os.getenv("MYSQL_HOST", "localhost")
+DB_NAME = os.getenv("MYSQL_DATABASE", "triagem_db")
 
-def enqueue_case(case_data):
-    # ...
-    # q.enqueue(process_new_case_job, case_data) # <--- Continua usando a função importada
-    # ...
+# URI de conexão para MySQL: mysql+pymysql://user:password@host/database
+app.config['SQLALCHEMY_DATABASE_URI'] = f'mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+db = SQLAlchemy(app)
 
-# --- 3. FUNÇÃO DE ORQUESTRAÇÃO DA LLM ---
+# --- 3. MODELO DE DADOS SQL ---
+
+class Caso(db.Model):
+    """Define a tabela 'caso' no banco de dados MySQL."""
+    id = db.Column(db.Integer, primary_key=True)
+    area_problema = db.Column(db.String(100), nullable=False)
+    fatos_chave = db.Column(db.Text, nullable=False)
+    urgencia = db.Column(db.String(20), nullable=False)
+    timestamp = db.Column(db.DateTime, default=db.func.now())
+    # Status que a tela de fila do especialista irá ler
+    status = db.Column(db.String(50), default='PENDENTE_ESPECIALISTA') 
+
+    def __repr__(self):
+        return f'<Caso {self.id} - {self.area_problema}>'
+
+# --- 4. FUNÇÃO DE ORQUESTRAÇÃO DA LLM ---
 
 def call_llm_api(user_message):
-    """
-    Chama a Gemini API para triagem estruturada usando Pydantic.
-    """
+    """Chama a Gemini API para triagem estruturada."""
     try:
         if not os.getenv("GEMINI_API_KEY"):
             raise ValueError("A variável de ambiente GEMINI_API_KEY não está configurada.")
@@ -70,25 +74,44 @@ def call_llm_api(user_message):
             ),
         )
 
-        # Retorna o dicionário Python do JSON da LLM
         return json.loads(response.text)
-    
+        
     except Exception as e:
         print(f"❌ ERRO GRAVE ao chamar a LLM: {e}")
         return None
 
-# --- 4. ROTAS DO FLASK ---
+# --- 5. FUNÇÃO DE PERSISTÊNCIA SQL ---
 
-app = Flask(__name__)
+def persist_case_to_sql(case_data):
+    """Cria uma nova linha no MySQL, marcando-a como PENDENTE_ESPECIALISTA."""
+    try:
+        novo_caso = Caso(
+            area_problema=case_data.get('area_problema'),
+            fatos_chave=case_data.get('fatos_chave'),
+            urgencia=case_data.get('urgencia')
+        )
+        
+        db.session.add(novo_caso)
+        db.session.commit()
+        print(f"[MYSQL] Caso {novo_caso.id} registrado para atendimento de especialista.")
+        return True
+    
+    except SQLAlchemyError as e:
+        db.session.rollback()
+        print(f"❌ ERRO MYSQL ao inserir caso: {e}")
+        return False
+
+# --- 6. ROTAS DO FLASK ---
 
 @app.route("/chat")
 def chat_page():
     """ Rota GET: Apenas renderiza a interface do chat (chat.html) """
+    # Nota: O arquivo 'chat.html' deve estar na pasta 'templates/'
     return render_template("chat.html")
 
 @app.route('/send_message', methods=['POST'])
 def process_chat_message():
-    """ Rota POST: Executa o pipeline completo: Receber -> LLM -> Enfileirar -> Responder """
+    """ Rota POST: Executa o pipeline SINCRONO: Receber -> LLM -> SQL -> Responder """
     
     try:
         data = request.get_json()
@@ -107,19 +130,22 @@ def process_chat_message():
     if processed_data:
         area_buscada = processed_data.get('area_problema', 'Não Classificado')
         
-        # ROTEAMENTO: Enfileira o caso
-        enqueue_case(processed_data)
+        # PERSISTÊNCIA E DIRECIONAMENTO
+        if not persist_case_to_sql(processed_data):
+            return jsonify({"error": "Falha ao registrar e direcionar o caso no banco de dados."}), 500
         
-        # RESPOSTA ao Usuário
+        # RESPOSTA ao Usuário, confirmando o encaminhamento para o especialista
         success_message = (
-            f"Sua solicitação foi classificada como **{area_buscada}** e enviada a um especialista. "
-            "O mesmo entrará em contato em breve!"
+            f"✅ Triagem Concluída! Sua solicitação na área de **{area_buscada}** foi registrada e "
+            "**direcionada para a fila de atendimento de um especialista**. "
+            "Você será contatado(a) por ele(a) em breve."
         )
         
         return jsonify({
             "status": "success", 
             "response_text": success_message,
-            "area_classified": area_buscada
+            "area_classified": area_buscada,
+            "urgency": processed_data.get('urgencia')
         }), 200
         
     else:
@@ -127,7 +153,9 @@ def process_chat_message():
 
 
 if __name__ == '__main__':
-    # Certifique-se de que você tem um arquivo 'chat.html' na pasta 'templates/'
-    # E que o Redis Server está rodando!
-    print("--- INICIANDO FLASK SERVER ---")
+    # Cria as tabelas do banco de dados antes de iniciar o servidor
+    with app.app_context():
+        db.create_all()
+    
+    print("--- INICIANDO FLASK SERVER (Com MySQL) ---")
     app.run(debug=True, port=5000)
